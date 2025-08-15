@@ -1,0 +1,20 @@
+package main
+
+import (
+	"fmt"
+
+	"github.com/google/gopacket/pcap"
+)
+
+func main() {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, device := range devices {
+		fmt.Println("Nombre:", device.Name)
+		fmt.Println("Descripción:", device.Description)
+		fmt.Println()
+	}
+}
