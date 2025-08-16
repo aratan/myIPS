@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -791,29 +792,52 @@ func (sm *StateManager) UnblockIP(ip string) {
 	logPrintln(colorGreen, fmt.Sprintf("🔓 IP %s desbloqueada", ip))
 }
 
+// --- VERSIÓN CORREGIDA Y SEGURA de manageUnblocks ---
 func (sm *StateManager) manageUnblocks() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		sm.mu.Lock()
-		var expiredIPs []string
+		sm.mu.Lock() // 1. Bloquea el mutex UNA SOLA VEZ al principio.
 
+		var expiredIPs []string
 		for ip, blockInfo := range sm.blockedIPs {
 			if time.Now().After(blockInfo.Expiry) {
 				expiredIPs = append(expiredIPs, ip)
 			}
 		}
-		sm.mu.Unlock()
 
-		// Desbloquear IPs expiradas
-		for _, ip := range expiredIPs {
-			logPrintln(colorCyan, fmt.Sprintf("⏳ Tiempo expirado para %s, desbloqueando...", ip))
-			go sm.UnblockIP(ip)
+		// Desbloquear IPs expiradas de forma SECUENCIAL Y SEGURA.
+		// Ya tenemos el lock, así que no hay necesidad de llamar a UnblockIP que lo volvería a tomar.
+		if len(expiredIPs) > 0 {
+			logPrintln(colorCyan, "⏳ Desbloqueando IPs expiradas...")
+			for _, ip := range expiredIPs {
+				// Ejecutamos la lógica de desbloqueo aquí directamente.
+				ruleName := getRuleName(ip)
+				var cmd *exec.Cmd
+				switch runtime.GOOS {
+				case "windows":
+					cmd = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
+				case "linux":
+					cmd = exec.Command("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP", "-m", "comment", "--comment", ruleName)
+				}
+
+				if cmd != nil {
+					if err := cmd.Run(); err != nil {
+						// Ignoramos el error "not found", es normal si la regla ya fue borrada manualmente.
+						if !isNotFoundError(err.Error()) {
+							logPrintln(colorYellow, fmt.Sprintf("⚠️ No se pudo eliminar la regla para %s: %v", ip, err))
+						}
+					}
+				}
+
+				// Eliminar del estado interno.
+				delete(sm.blockedIPs, ip)
+				logPrintln(colorGreen, fmt.Sprintf("🔓 IP %s desbloqueada.", ip))
+			}
 		}
 
-		// Mostrar estado actual de bloqueos
-		sm.mu.Lock()
+		// Mostrar estado actual de bloqueos (todavía dentro del mismo lock).
 		if len(sm.blockedIPs) > 0 {
 			logPrintln(colorMagenta, fmt.Sprintf("🔒 IPs bloqueadas activas: %d", len(sm.blockedIPs)))
 			for ip, info := range sm.blockedIPs {
@@ -824,7 +848,8 @@ func (sm *StateManager) manageUnblocks() {
 				}
 			}
 		}
-		sm.mu.Unlock()
+
+		sm.mu.Unlock() // 2. Desbloquea el mutex UNA SOLA VEZ al final.
 	}
 }
 
@@ -839,4 +864,15 @@ func (sm *StateManager) IsBlocked(ip string) bool {
 	defer sm.mu.Unlock()
 	_, exists := sm.blockedIPs[ip]
 	return exists
+}
+
+// getRuleName generates a consistent rule name for firewall operations.
+func getRuleName(ip string) string {
+	return fmt.Sprintf("IPS_Block_%s", ip)
+}
+
+// isNotFoundError checks if the error message indicates a "not found" condition for firewall rules.
+// This is a simple string match and might need refinement for different OS/firewall outputs.
+func isNotFoundError(errMsg string) bool {
+	return strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "no rules matching")
 }
